@@ -1,0 +1,133 @@
+# 毎日 ODPT から時刻表を取得し、アプリと一緒に GitHub Pages に公開する。
+# トークンはリポジトリの Secret（ODPT_TOKEN）にだけ保存され、公開されるのは時刻表のデータだけ。
+name: 時刻表を更新して公開
+
+on:
+  schedule:
+    - cron: "0 19 * * *"   # 毎日 4:00（日本時間）
+  workflow_dispatch:         # Actions 画面から手動でも実行できる
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: アプリのファイルをコピー
+        run: |
+          mkdir -p site
+          cp index.html manifest.webmanifest icon.svg site/
+          cp sw.js site/ 2>/dev/null || true
+
+      - name: 時刻表を取得
+        env:
+          ODPT_TOKEN: ${{ secrets.ODPT_TOKEN }}
+          ODPT_BASE: ${{ vars.ODPT_BASE }}
+          OPERATORS: ${{ vars.OPERATORS }}
+          DEFAULT_STATIONS: ${{ vars.DEFAULT_STATIONS }}
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, collections, datetime, pathlib, urllib.parse, urllib.request
+
+          KEY = os.environ.get("ODPT_TOKEN", "").strip()
+          if not KEY:
+              sys.exit("Secret の ODPT_TOKEN が設定されていません")
+          BASE = (os.environ.get("ODPT_BASE") or "https://api-challenge.odpt.org/api/v4/").rstrip("/") + "/"
+          OPS = [o.strip() for o in (os.environ.get("OPERATORS") or "TokyoMetro,Toei").split(",") if o.strip()]
+          out = pathlib.Path("site/data")
+          (out / "tt").mkdir(parents=True, exist_ok=True)
+
+          def get(path, **q):
+              q["acl:consumerKey"] = KEY
+              url = BASE + path + "?" + urllib.parse.urlencode(q)
+              try:
+                  with urllib.request.urlopen(url, timeout=180) as r:
+                      return json.load(r)
+              except Exception as e:  # URL にはトークンが入るので表示しない
+                  raise RuntimeError(f"{path} {q.get('odpt:operator') or q.get('odpt:railway') or ''}: {e}") from None
+
+          tail = lambda s: (s or "").split(":")[-1].split(".")[-1]
+          title = lambda o, k: (o.get(k) or {}).get("ja") or o.get("dc:title") or tail(o.get("owl:sameAs"))
+
+          # 行き先は他社線の駅のこともあるので、全駅の名前を先に集める
+          names, stations = {}, []
+          try:
+              allst = get("odpt:Station")
+          except Exception as e:
+              print("全駅の一覧は取得できなかったので、事業者ごとに取得します:", e)
+              allst = []
+          for op in OPS:
+              if not any(s.get("odpt:operator") == f"odpt.Operator:{op}" for s in allst):
+                  allst += get("odpt:Station", **{"odpt:operator": f"odpt.Operator:{op}"})
+          for s in allst:
+              names[s["owl:sameAs"]] = title(s, "odpt:stationTitle")
+
+          per_station = collections.defaultdict(list)
+          for op in OPS:
+              railways = get("odpt:Railway", **{"odpt:operator": f"odpt.Operator:{op}"})
+              for rw in railways:
+                  rname = title(rw, "odpt:railwayTitle")
+                  try:
+                      tts = get("odpt:StationTimetable", **{"odpt:railway": rw["owl:sameAs"]})
+                  except Exception as e:
+                      print("スキップ:", e)
+                      continue
+                  for tt in tts:
+                      times = []
+                      for o in tt.get("odpt:stationTimetableObject") or []:
+                          hm = o.get("odpt:departureTime")
+                          if not hm:
+                              continue
+                          dst = (o.get("odpt:destinationStation") or [None])[0]
+                          times.append([hm, names.get(dst) or tail(dst), tail(o.get("odpt:trainType")), 1 if o.get("odpt:isLast") else 0])
+                      if not times:
+                          continue
+                      times.sort(key=lambda t: (int(t[0][:2]) + (24 if int(t[0][:2]) < 3 else 0), t[0][3:]))
+                      main = collections.Counter(t[1] for t in times).most_common(1)[0][0]
+                      sid = tt["odpt:station"]
+                      per_station[sid].append({"dir": f"{main}方面", "cal": tail(tt.get("odpt:calendar")), "times": times})
+                      if not any(x["id"] == sid for x in stations):
+                          stations.append({"id": sid, "name": names.get(sid) or tail(sid), "railway": rname})
+                  print(f"{op} {rname}: OK")
+
+          fileof = lambda i: "".join(c if c.isalnum() or c in "._-" else "_" for c in i)
+          for sid, lst in per_station.items():
+              (out / "tt" / f"{fileof(sid)}.json").write_text(json.dumps(lst, ensure_ascii=False, separators=(",", ":")))
+          (out / "stations.json").write_text(json.dumps(stations, ensure_ascii=False, separators=(",", ":")))
+
+          # 初めて開いた人に最初から表示する駅（例：渋谷/銀座線,大手町/丸ノ内線）
+          defaults = []
+          for item in (os.environ.get("DEFAULT_STATIONS") or "").split(","):
+              name, _, line = item.strip().partition("/")
+              hit = next((s for s in stations if s["name"] == name and (not line or line in s["railway"])), None)
+              if hit:
+                  defaults.append(hit)
+              elif name:
+                  print("最初に表示する駅が見つかりません:", item)
+          jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
+          (out / "index.json").write_text(json.dumps({"updated": jst.strftime("%-m/%-d %H:%M"), "operators": OPS, "defaultStations": defaults}, ensure_ascii=False))
+          if not stations:
+              sys.exit("時刻表を1件も取得できませんでした。トークン・API・事業者の設定を確認してください")
+          print(f"{len(stations)}駅の時刻表を保存しました")
+          PY
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4
