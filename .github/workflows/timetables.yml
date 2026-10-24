@@ -29,9 +29,17 @@ jobs:
 
       - name: アプリのファイルをコピー
         run: |
+          # index.html がフォルダの中に入っていても見つけてコピーする
+          src=$(dirname "$(find . -name index.html -not -path './site/*' -not -path './.git/*' | head -n 1)")
+          if [ "$src" = "." ] && [ ! -f index.html ]; then
+            echo "::error::index.html がリポジトリにありません。index.html をアップロードしてください"
+            ls -R | head -50
+            exit 1
+          fi
+          echo "アプリのファイルの場所: $src"
           mkdir -p site
-          cp index.html manifest.webmanifest icon.svg site/
-          cp sw.js site/ 2>/dev/null || true
+          cp "$src/index.html" site/
+          for f in manifest.webmanifest icon.svg sw.js; do cp "$src/$f" site/ 2>/dev/null || echo "$f がないので省略"; done
 
       - name: 時刻表を取得
         env:
