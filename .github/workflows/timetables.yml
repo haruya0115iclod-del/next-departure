@@ -86,9 +86,38 @@ jobs:
               if not any(x["id"] == sid for x in stations):
                   stations.append({"id": sid, "name": names.get(sid) or tail(sid), "railway": rname})
 
-          def from_station_tt(rw, rname):
+
+          # 路線指定 → 事業者指定 → 一括ダウンロード（〜.json）の順に試す。APIによって使える取り方が違うため
+          op_cache, dump_cache, used = {}, {}, collections.defaultdict(set)
+          def records(typ, rw, op):
+              try:
+                  r = get(typ, **{"odpt:railway": rw})
+                  if r:
+                      used[typ].add("路線指定"); return r
+              except Exception as e:
+                  print("  ", e)
+              if (typ, op) not in op_cache:
+                  try:
+                      op_cache[(typ, op)] = get(typ, **{"odpt:operator": f"odpt.Operator:{op}"})
+                  except Exception as e:
+                      print("  ", e); op_cache[(typ, op)] = []
+              r = [x for x in op_cache[(typ, op)] if x.get("odpt:railway") == rw]
+              if r:
+                  used[typ].add("事業者指定"); return r
+              if typ not in dump_cache:
+                  try:
+                      dump_cache[typ] = get(typ + ".json")
+                      print(f"  {typ} の一括データ: {len(dump_cache[typ])}件")
+                  except Exception as e:
+                      print("  ", e); dump_cache[typ] = []
+              r = [x for x in dump_cache[typ] if x.get("odpt:railway") == rw]
+              if r:
+                  used[typ].add("一括ダウンロード")
+              return r
+
+          def from_station_tt(rw, rname, op):
               """駅時刻表（odpt:StationTimetable）から作る。作れた駅の数を返す"""
-              tts = get("odpt:StationTimetable", **{"odpt:railway": rw})
+              tts = records("odpt:StationTimetable", rw, op)
               n = 0
               for tt in tts:
                   times = []
@@ -105,9 +134,9 @@ jobs:
                   print("  駅時刻表のデータ形式が想定と違います。先頭の項目:", sorted(tts[0].keys()))
               return n
 
-          def from_train_tt(rw, rname):
+          def from_train_tt(rw, rname, op):
               """列車時刻表（odpt:TrainTimetable）を駅ごとに並べ替えて作る。作れた駅の数を返す"""
-              trains = get("odpt:TrainTimetable", **{"odpt:railway": rw})
+              trains = records("odpt:TrainTimetable", rw, op)
               bucket = collections.defaultdict(list)
               for tr in trains:
                   cal = tail(tr.get("odpt:calendar"))
@@ -131,12 +160,12 @@ jobs:
                   rname = title(rw, "odpt:railwayTitle")
                   n, how = 0, ""
                   try:
-                      n, how = from_station_tt(rw["owl:sameAs"], rname), "駅時刻表"
+                      n, how = from_station_tt(rw["owl:sameAs"], rname, op), "駅時刻表"
                   except Exception as e:
                       print("  駅時刻表を取得できません:", e)
                   if not n:
                       try:
-                          n, how = from_train_tt(rw["owl:sameAs"], rname), "列車時刻表"
+                          n, how = from_train_tt(rw["owl:sameAs"], rname, op), "列車時刻表"
                       except Exception as e:
                           print("  列車時刻表を取得できません:", e)
                   print(f"{op} {rname}: {how}から{n}駅" if n else f"{op} {rname}: 時刻表なし")
@@ -157,7 +186,12 @@ jobs:
                   print("最初に表示する駅が見つかりません:", item)
           jst = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9)))
           (out / "index.json").write_text(json.dumps({"updated": jst.strftime("%-m/%-d %H:%M"), "operators": OPS, "defaultStations": defaults}, ensure_ascii=False))
+          for typ, how in used.items():
+              print(f"{typ}: {'・'.join(sorted(how))}で取得")
           if not stations:
+              # どこにデータがあるか調べやすいように、取れたデータの事業者を表示する
+              for typ, recs in dump_cache.items():
+                  print(f"{typ} の一括データにある事業者:", sorted({x.get("odpt:operator", "?") for x in recs}) or "なし")
               sys.exit("時刻表を1件も取得できませんでした。トークン・API・事業者の設定を確認してください")
           print(f"{len(stations)}駅の時刻表を保存しました")
           PY
