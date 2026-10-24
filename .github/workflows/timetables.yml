@@ -47,13 +47,20 @@ jobs:
           if not KEY:
               sys.exit("Secret の ODPT_TOKEN が設定されていません")
           BASE = (os.environ.get("ODPT_BASE") or "https://api-challenge.odpt.org/api/v4/").rstrip("/") + "/"
-          OPS = [o.strip() for o in (os.environ.get("OPERATORS") or "TokyoMetro,Toei").split(",") if o.strip()]
+          OPS = [o.strip() for o in (os.environ.get("OPERATORS") or "JR-East,Keikyu,Keio,Odakyu,Seibu,Sotetsu,Tobu,Tokyu,Toei").split(",") if o.strip()]
           out = pathlib.Path("site/data")
           (out / "tt").mkdir(parents=True, exist_ok=True)
 
-          def get(path, **q):
-              q["acl:consumerKey"] = KEY
-              url = BASE + path + "?" + urllib.parse.urlencode(q)
+          # 都営はチャレンジ用APIに時刻表がないので、トークン不要の公開APIから取る
+          PUBLIC = "https://api-public.odpt.org/api/v4/"
+          PUBLIC_OPS = {"Toei"}
+
+          def get(path, _op=None, **q):
+              if _op in PUBLIC_OPS:
+                  url = PUBLIC + path + ("?" + urllib.parse.urlencode(q) if q else "")
+              else:
+                  q["acl:consumerKey"] = KEY
+                  url = BASE + path + "?" + urllib.parse.urlencode(q)
               try:
                   with urllib.request.urlopen(url, timeout=180) as r:
                       return json.load(r)
@@ -62,48 +69,61 @@ jobs:
 
           tail = lambda s: (s or "").split(":")[-1].split(".")[-1]
           title = lambda o, k: (o.get(k) or {}).get("ja") or o.get("dc:title") or tail(o.get("owl:sameAs"))
+          op_of = lambda sid: (sid or "").split(":")[-1].split(".")[0]
 
-          # 行き先は他社線の駅のこともあるので、全駅の名前を先に集める
-          names, stations = {}, []
-          try:
-              allst = get("odpt:Station")
-          except Exception as e:
-              print("全駅の一覧は取得できなかったので、事業者ごとに取得します:", e)
-              allst = []
+          # 駅名は事業者ごとに取る（事業者を指定しない一覧は1000件で打ち切られるため）
+          names, loaded_ops = {}, set()
+          def load_names(op):
+              if op in loaded_ops:
+                  return
+              loaded_ops.add(op)
+              try:
+                  for s in get("odpt:Station", op, **{"odpt:operator": f"odpt.Operator:{op}"}):
+                      names[s["owl:sameAs"]] = title(s, "odpt:stationTitle")
+              except Exception as e:
+                  print("  駅名を取得できません:", e)
           for op in OPS:
-              if not any(s.get("odpt:operator") == f"odpt.Operator:{op}" for s in allst):
-                  allst += get("odpt:Station", **{"odpt:operator": f"odpt.Operator:{op}"})
-          for s in allst:
-              names[s["owl:sameAs"]] = title(s, "odpt:stationTitle")
+              load_names(op)
 
-          per_station = collections.defaultdict(list)
+          # 列車種別（odpt.TrainType:Odakyu.RapidExpress → 快速急行）
+          types = {}
+          for op in [None] + sorted(PUBLIC_OPS & set(OPS)):
+              try:
+                  for t in get("odpt:TrainType", op):
+                      types[t["owl:sameAs"]] = title(t, "odpt:trainTypeTitle")
+              except Exception as e:
+                  print("  列車種別を取得できません:", e)
+          DIR_JA = {"Inbound": "上り", "Outbound": "下り", "InnerLoop": "内回り", "OuterLoop": "外回り"}
+
+          # 行き先の駅名はあとでまとめて引くので、ここでは駅IDのまま持つ
+          per_station = collections.defaultdict(list)   # 駅ID → [{rd, cal, times:[[時刻, 行き先ID, 種別, 終電]]}]
+          railway_of = {}
           order = lambda hm: (int(hm[:2]) + (24 if int(hm[:2]) < 3 else 0)) * 60 + int(hm[3:5])
 
-          def add(sid, cal, times, rname):
+          def add(sid, rd, cal, times, rname):
               times.sort(key=lambda t: order(t[0]))
-              main = collections.Counter(t[1] for t in times).most_common(1)[0][0]
-              per_station[sid].append({"dir": f"{main}方面", "cal": cal, "times": times})
-              if not any(x["id"] == sid for x in stations):
-                  stations.append({"id": sid, "name": names.get(sid) or tail(sid), "railway": rname})
-
+              per_station[sid].append({"rd": tail(rd), "cal": cal, "times": times})
+              railway_of.setdefault(sid, rname)
 
           # 路線指定 → 事業者指定 → 一括ダウンロード（〜.json）の順に試す。APIによって使える取り方が違うため
           op_cache, dump_cache, used = {}, {}, collections.defaultdict(set)
           def records(typ, rw, op):
               try:
-                  r = get(typ, **{"odpt:railway": rw})
+                  r = get(typ, op, **{"odpt:railway": rw})
                   if r:
                       used[typ].add("路線指定"); return r
               except Exception as e:
                   print("  ", e)
               if (typ, op) not in op_cache:
                   try:
-                      op_cache[(typ, op)] = get(typ, **{"odpt:operator": f"odpt.Operator:{op}"})
+                      op_cache[(typ, op)] = get(typ, op, **{"odpt:operator": f"odpt.Operator:{op}"})
                   except Exception as e:
                       print("  ", e); op_cache[(typ, op)] = []
               r = [x for x in op_cache[(typ, op)] if x.get("odpt:railway") == rw]
               if r:
                   used[typ].add("事業者指定"); return r
+              if op in PUBLIC_OPS:
+                  return []
               if typ not in dump_cache:
                   try:
                       dump_cache[typ] = get(typ + ".json")
@@ -118,7 +138,7 @@ jobs:
           def from_station_tt(rw, rname, op):
               """駅時刻表（odpt:StationTimetable）から作る。作れた駅の数を返す"""
               tts = records("odpt:StationTimetable", rw, op)
-              n = 0
+              done = set()
               for tt in tts:
                   times = []
                   for o in tt.get("odpt:stationTimetableObject") or []:
@@ -126,13 +146,13 @@ jobs:
                       if not hm:
                           continue
                       dst = (o.get("odpt:destinationStation") or [None])[0]
-                      times.append([hm, names.get(dst) or tail(dst), tail(o.get("odpt:trainType")), 1 if o.get("odpt:isLast") else 0])
+                      times.append([hm, dst, o.get("odpt:trainType"), 1 if o.get("odpt:isLast") else 0])
                   if times:
-                      add(tt["odpt:station"], tail(tt.get("odpt:calendar")), times, rname)
-                      n += 1
-              if tts and not n:
+                      add(tt["odpt:station"], tt.get("odpt:railDirection"), tail(tt.get("odpt:calendar")), times, rname)
+                      done.add(tt["odpt:station"])
+              if tts and not done:
                   print("  駅時刻表のデータ形式が想定と違います。先頭の項目:", sorted(tts[0].keys()))
-              return n
+              return len(done)
 
           def from_train_tt(rw, rname, op):
               """列車時刻表（odpt:TrainTimetable）を駅ごとに並べ替えて作る。作れた駅の数を返す"""
@@ -141,21 +161,20 @@ jobs:
               for tr in trains:
                   cal = tail(tr.get("odpt:calendar"))
                   dst = (tr.get("odpt:destinationStation") or [None])[0]
-                  typ = tail(tr.get("odpt:trainType"))
                   for o in tr.get("odpt:trainTimetableObject") or []:
                       sid, hm = o.get("odpt:departureStation"), o.get("odpt:departureTime")
                       if sid and hm and sid != dst:
-                          bucket[(sid, tr.get("odpt:railDirection"), cal)].append([hm, names.get(dst) or tail(dst), typ, 0])
-              for (sid, _, cal), times in bucket.items():
+                          bucket[(sid, tr.get("odpt:railDirection"), cal)].append([hm, dst, tr.get("odpt:trainType"), 0])
+              for (sid, rd, cal), times in bucket.items():
                   times.sort(key=lambda t: order(t[0]))
                   times[-1][3] = 1   # その方向の最終列車を終電とする
-                  add(sid, cal, times, rname)
+                  add(sid, rd, cal, times, rname)
               if trains and not bucket:
                   print("  列車時刻表のデータ形式が想定と違います。先頭の項目:", sorted(trains[0].keys()))
               return len({k[0] for k in bucket})
 
           for op in OPS:
-              railways = get("odpt:Railway", **{"odpt:operator": f"odpt.Operator:{op}"})
+              railways = get("odpt:Railway", op, **{"odpt:operator": f"odpt.Operator:{op}"})
               for rw in railways:
                   rname = title(rw, "odpt:railwayTitle")
                   n, how = 0, ""
@@ -170,12 +189,35 @@ jobs:
                           print("  列車時刻表を取得できません:", e)
                   print(f"{op} {rname}: {how}から{n}駅" if n else f"{op} {rname}: 時刻表なし")
 
+          # 直通先（京成・東京メトロなど）の行き先の駅名を、その事業者の駅一覧から引く
+          dests = {t[1] for lst in per_station.values() for x in lst for t in x["times"] if t[1]}
+          for op in sorted({op_of(d) for d in dests | set(per_station) if d not in names}):
+              load_names(op)
+          # 路線違いで同じ駅（odpt.Station:JR-East.Yamanote.Tokyo と JR-East.Chuo.Tokyo など）の名前も使う
+          by_tail = {}
+          for sid, nm in names.items():
+              by_tail.setdefault((op_of(sid), tail(sid)), nm)
+          name_of = lambda sid: (names.get(sid) or by_tail.get((op_of(sid), tail(sid))) or tail(sid)) if sid else ""
+          missing = sorted({tail(d) for d in dests | set(per_station) if name_of(d) == tail(d)})
+          if missing:
+              print(f"日本語名が見つからない駅（{len(missing)}）:", ", ".join(missing[:30]))
+
           fileof = lambda i: "".join(c if c.isalnum() or c in "._-" else "_" for c in i)
+          stations = []
           for sid, lst in per_station.items():
-              (out / "tt" / f"{fileof(sid)}.json").write_text(json.dumps(lst, ensure_ascii=False, separators=(",", ":")))
+              rows = []
+              for x in lst:
+                  times = [[hm, name_of(d), types.get(ty) or tail(ty), last] for hm, d, ty, last in x["times"]]
+                  # 山手線・大江戸線などの環状線は行き先がない列車が多いので「内回り」「外回り」だけにする
+                  dc = collections.Counter(t[1] for t in times if t[1])
+                  main = dc.most_common(1)[0][0] if sum(dc.values()) * 2 >= len(times) else ""
+                  rd = DIR_JA.get(x["rd"])
+                  rows.append({"dir": "・".join(filter(None, [rd, main and f"{main}方面"])) or x["rd"], "cal": x["cal"], "times": times})
+              (out / "tt" / f"{fileof(sid)}.json").write_text(json.dumps(rows, ensure_ascii=False, separators=(",", ":")))
+              stations.append({"id": sid, "name": name_of(sid), "railway": railway_of[sid]})
           (out / "stations.json").write_text(json.dumps(stations, ensure_ascii=False, separators=(",", ":")))
 
-          # 初めて開いた人に最初から表示する駅（例：渋谷/銀座線,大手町/丸ノ内線）
+          # 初めて開いた人に最初から表示する駅（例：新宿/小田原線,渋谷/東横線）
           defaults = []
           for item in (os.environ.get("DEFAULT_STATIONS") or "").split(","):
               name, _, line = item.strip().partition("/")
